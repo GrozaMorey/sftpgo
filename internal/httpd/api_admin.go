@@ -23,8 +23,11 @@ import (
 
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/go-chi/render"
+	"github.com/rs/xid"
 
+	"github.com/drakkan/sftpgo/v2/internal/common"
 	"github.com/drakkan/sftpgo/v2/internal/dataprovider"
+	"github.com/drakkan/sftpgo/v2/internal/logger"
 	"github.com/drakkan/sftpgo/v2/internal/smtp"
 	"github.com/drakkan/sftpgo/v2/internal/util"
 )
@@ -344,4 +347,80 @@ func getTokenClaims(r *http.Request) (jwtTokenClaims, error) {
 	tokenClaims.Decode(claims)
 
 	return tokenClaims, nil
+}
+
+func uploadToUserFiles(w http.ResponseWriter, r *http.Request) {
+	if maxUploadFileSize > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, maxUploadFileSize)
+	}
+
+	connection, err := getUserConnectionByUsername(w, r)
+	if err != nil {
+		return
+	}
+	defer common.Connections.Remove(connection.GetID())
+
+	transferQuota := connection.GetTransferQuota()
+	if !transferQuota.HasUploadSpace() {
+		connection.Log(logger.LevelInfo, "denying file write due to transfer quota limits")
+		sendAPIResponse(w, r, common.ErrQuotaExceeded, "Denying file write due to transfer quota limits",
+			http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	t := newThrottledReader(r.Body, connection.User.UploadBandwidth, connection)
+	r.Body = t
+	err = r.ParseMultipartForm(maxMultipartMem)
+	if err != nil {
+		connection.RemoveTransfer(t)
+		sendAPIResponse(w, r, err, "Unable to parse multipart form", http.StatusBadRequest)
+		return
+	}
+	connection.RemoveTransfer(t)
+	defer r.MultipartForm.RemoveAll() //nolint:errcheck
+
+	parentDir := connection.User.GetCleanedPath(r.URL.Query().Get("path"))
+	files := r.MultipartForm.File["filenames"]
+	if len(files) == 0 {
+		sendAPIResponse(w, r, nil, "No files uploaded!", http.StatusBadRequest)
+		return
+	}
+	connection.User.CheckFsRoot(connection.ID) //nolint:errcheck
+	if getBoolQueryParam(r, "mkdir_parents") {
+		if err = connection.CheckParentDirs(parentDir); err != nil {
+			sendAPIResponse(w, r, err, "Error checking parent directories", getMappedStatusCode(err))
+			return
+		}
+	}
+	doUploadFiles(w, r, connection, parentDir, files)
+}
+func getUserConnectionByUsername(w http.ResponseWriter, r *http.Request) (*Connection, error) {
+	claims, err := getTokenClaims(r)
+	if err != nil || claims.Username == "" {
+		sendAPIResponse(w, r, err, "Invalid token claims", http.StatusBadRequest)
+		return nil, fmt.Errorf("invalid token claims %w", err)
+	}
+	username := getURLParam(r, "username")
+	user, err := dataprovider.GetUserWithGroupSettings(username, "")
+	if err != nil {
+		sendAPIResponse(w, r, nil, "Unable to retrieve your user", getRespStatus(err))
+		return nil, err
+	}
+	connID := xid.New().String()
+	protocol := getProtocolFromRequest(r)
+	connectionID := fmt.Sprintf("%v_%v", protocol, connID)
+	if err := checkHTTPClientUser(&user, r, connectionID, false); err != nil {
+		sendAPIResponse(w, r, err, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+		return nil, err
+	}
+	connection := &Connection{
+		BaseConnection: common.NewBaseConnection(connID, protocol, util.GetHTTPLocalAddress(r),
+			r.RemoteAddr, user),
+		request: r,
+	}
+	if err = common.Connections.Add(connection); err != nil {
+		sendAPIResponse(w, r, err, "Unable to add connection", http.StatusTooManyRequests)
+		return connection, err
+	}
+	return connection, nil
 }
